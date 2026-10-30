@@ -113,8 +113,11 @@ svg.i{width:46%;height:46%;fill:#fff}
         <select id="sLim"><option value="30">30分</option><option value="60">60分</option></select></div>
       <div class="sg"><h3>話し相手の声</h3>
         <select id="sVoice"></select>
+        <label>話す速さ<select id="sSpeed"><option value="1">ふつう</option><option value="0.92">ややゆっくり（初期値）</option><option value="0.85">ゆっくり</option></select></label>
+        <button class="tb" id="sTest">声を聞いてみる</button>
         <div class="st2" id="vHint"></div>
-        <div class="st2" style="line-height:1.6;margin-top:8px">次の通話から使われます。初期値はDipperです。選んだ声が使えないときは、自動で予備の声（Charon）に切り替わります。</div></div>
+        <div class="st2" style="line-height:1.6;margin-top:8px">次の通話から使われます。男性の声と女性の声を選べます。選んだ声が使えないときは、自動で予備の声（Charon）に切り替わります。性別は目安なので、試し聞きで確かめてください。</div></div>
+      <div class="sg"><h3>前回の通話の記録（うまくいかないとき用）</h3><div class="st2" id="lastErr" style="line-height:1.6"></div></div>
       <p style="font-size:18px">「＊」の連絡先との通話中の声は、Gemini Live APIに送られます（上の説明を見てください）。</p>
       <div class="sg"><h3>マイクをオンにする</h3>
         <div class="st2" style="line-height:1.6">初めて会話するとき、マイクの許可を求める表示が出たら「許可」を押します。<br>Android：Chromeのメニュー → 設定 → サイトの設定 → マイク で、このページを「許可」にします。ホーム画面のアプリから使う場合は、設定 → アプリ → Chrome → 権限 → マイク も「許可」にします。<br>iPhone：設定 → アプリ → Safari → マイク で「許可」にします。<br>※通信が必要です。電波の弱い場所では、通話が切れることがあります。</div></div>
@@ -275,9 +278,9 @@ function voicemail(){
   });
 }
 /* ---------- 音声会話（Gemini Live API：ブラウザからWebSocketで直接つなぐ） ---------- */
-var MAX_TURNS=20,S={mins:60,lv:'Dipper'},DEFAULT_VOICE='Charon';
-var CLOSING='あ、すみません。携帯の通信制限がきてしまいまして、一度ここで切れちゃいそうです。また電波が良いときに、ぜひお話ししましょうね。それでは、失礼します。';
-var aiOn=false,hist=[],ws=null,micStream=null,micCtx=null,micNode=null,ready=false,greeted=false,turns=0,speaking=false,endAfter=false,liveGen=0,lastAct=0,pbT=0,pbN=0,srcs=[],unT=null,wdT=null;
+var MAX_TURNS=20,S={mins:60,lv:'Charon',sp:.92},DEFAULT_VOICE='Charon';
+var CLOSING='すみません。携帯の通信制限がきてしまいまして、一度ここで切れちゃいそうです。また電波が良いときに、ぜひお話ししましょうね。それでは、失礼します。';
+var aiOn=false,hist=[],ws=null,micStream=null,micCtx=null,micNode=null,ready=false,greeted=false,turns=0,speaking=false,endAfter=false,closing=false,liveGen=0,lastAct=0,pbT=0,pbN=0,srcs=[],unT=null,wdT=null,ringEnd=0,testWs=null,testGen=0;
 function limitMs(){return S.mins*60000}
 /* 名前の設定（localStorage）。初回だけ初期値を入れ、保存済みの値は上書きしない */
 var PK='phoneSimPersona',PDEF={ai_name:'佐藤',grandfather_name:'',daughter_name:''},P={};
@@ -292,7 +295,17 @@ function loadP(){
 }
 function saveP(){try{localStorage.setItem(PK,JSON.stringify(P))}catch(e){}}
 function wipe(){hist.length=0;turns=0;greeted=false}
+/* うまくいかなかった原因を、設定画面で見られるように記録する（会話の内容は記録しない） */
+function logErr(s){try{localStorage.setItem('phoneSimLastErr',new Date().toLocaleString('ja-JP')+'　'+String(s).slice(0,240))}catch(e){}}
 function b64(buf){var u=new Uint8Array(buf),s='';for(var i=0;i<u.length;i++)s+=String.fromCharCode(u[i]);return btoa(s)}
+function wsUrl(token){return 'wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContentConstrained?access_token='+encodeURIComponent(token)}
+function setupMsg(tk,voice){
+  return {setup:{model:'models/'+tk.model,
+    generationConfig:{responseModalities:['AUDIO'],speechConfig:{voiceConfig:{prebuiltVoiceConfig:{voiceName:voice}}}},
+    systemInstruction:{parts:[{text:tk.systemInstruction}]},
+    /* 言葉に詰まっても、すぐに話し終えたと判断しない（2秒の間まで待つ） */
+    realtimeInputConfig:{automaticActivityDetection:{startOfSpeechSensitivity:'START_SENSITIVITY_LOW',endOfSpeechSensitivity:'END_SENSITIVITY_LOW',prefixPaddingMs:200,silenceDurationMs:2000}}}};
+}
 /* 再生を止める */
 function stopPlay(){srcs.forEach(function(s){try{s.onended=null;s.stop()}catch(e){}});srcs=[];pbN=0;pbT=0;speaking=false;clearTimeout(unT)}
 /* マイクを止める */
@@ -308,28 +321,35 @@ function liveStop(){
   stopMic();stopPlay();
 }
 function aiStop(){liveStop()}
-/* 回数・時間の上限や通信エラーのときは、「通信制限」のひと言（mp3）を流して切る */
+/* 回数・時間の上限や通信エラーのときは、「通信制限」のひと言（mp3）を流して切る（呼び出し音が鳴り終わるまで待つ） */
 function liveClosing(){
-  if(!active)return;
-  liveStop();stopRing();$('cSt').textContent='電話を切ります…';
-  speak2('lim',CLOSING,hang);
+  if(!active||closing)return;
+  closing=true;liveStop();
+  var go=function(){if(!active)return;stopRing();$('cSt').textContent='電話を切ります…';speak2('lim',CLOSING,hang)};
+  var d=ringEnd-Date.now();
+  if(d>0)T(go,d);else go();
 }
 function checkEnd(){if(aiOn&&endAfter&&!speaking&&pbN===0)liveClosing()}
 function onLimit(){if(!aiOn)return;endAfter=true;checkEnd()}
-function getToken(voice){
+function getToken(voice,test){
   var ctl=new AbortController(),tm=setTimeout(function(){try{ctl.abort()}catch(e){}},10000);
   return fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},signal:ctl.signal,
-    body:JSON.stringify({voice:voice,minutes:S.mins,persona:{ai_name:P.ai_name||'',grandfather_name:P.grandfather_name||'',daughter_name:P.daughter_name||''}})
-  }).then(function(r){clearTimeout(tm);if(!r.ok)throw new Error('http '+r.status);return r.json()})
-    .then(function(d){if(!d||!d.token||!d.model)throw new Error('token');return d});
+    body:JSON.stringify({voice:voice,test:!!test,minutes:S.mins,persona:{ai_name:P.ai_name||'',grandfather_name:P.grandfather_name||'',daughter_name:P.daughter_name||''}})
+  }).then(function(r){
+    clearTimeout(tm);
+    if(!r.ok)return r.json().catch(function(){return{}}).then(function(d){throw new Error('token '+r.status+' '+(d.error||'')+' '+(d.detail||''))});
+    return r.json();
+  }).then(function(d){if(!d||!d.token||!d.model)throw new Error('token empty');return d});
 }
 async function aiCall(){
-  $('cSt').textContent='接続中…';ring(3,3);
-  var my=++liveGen;aiOn=true;greeted=false;turns=0;endAfter=false;
+  $('cSt').textContent='発信中…';
+  ringEnd=Date.now()+9000;ring(9,3); /* 3コール */
+  var my=++liveGen;aiOn=true;greeted=false;turns=0;endAfter=false;closing=false;
   T(onLimit,limitMs());
   try{
     micStream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true,autoGainControl:true,channelCount:1}});
   }catch(e){
+    logErr('マイク: '+(e&&e.name||e));
     if(my!==liveGen||!active)return;
     liveStop();stopRing();
     say('マイクが使えません。端末の設定で、マイクを許可してください。',function(){if(active)voicemail()},.9,.85,'');
@@ -337,71 +357,74 @@ async function aiCall(){
   }
   if(my!==liveGen||!active){stopMic();return}
   var tk;
-  try{tk=await getToken(S.lv)}catch(e){if(my===liveGen&&active)liveClosing();return}
+  try{tk=await getToken(S.lv)}catch(e){logErr(e&&e.message||e);if(my===liveGen&&active)liveClosing();return}
   if(my!==liveGen||!active)return;
   connect(my,tk,tk.voice||S.lv,false);
 }
 function connect(my,tk,voice,isFallback){
   var w;
-  try{w=new WebSocket('wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContentConstrained?access_token='+encodeURIComponent(tk.token))}
-  catch(e){liveClosing();return}
+  try{w=new WebSocket(wsUrl(tk.token))}catch(e){logErr('WebSocket作成: '+e);liveClosing();return}
   ws=w;ready=false;
   var chain=Promise.resolve();
-  w.onopen=function(){
-    if(my!==liveGen)return;
-    w.send(JSON.stringify({setup:{model:'models/'+tk.model,
-      generationConfig:{responseModalities:['AUDIO'],speechConfig:{voiceConfig:{prebuiltVoiceConfig:{voiceName:voice}}}},
-      systemInstruction:{parts:[{text:tk.systemInstruction}]}}}));
-  };
+  w.onopen=function(){if(my!==liveGen)return;w.send(JSON.stringify(setupMsg(tk,voice)))};
   w.onmessage=function(ev){
     chain=chain.then(function(){return typeof ev.data==='string'?ev.data:ev.data.text()})
       .then(function(s){if(my===liveGen&&ws===w)onMsg(my,w,voice,isFallback,JSON.parse(s))})
       .catch(function(){});
   };
   w.onerror=function(){};
-  w.onclose=function(){
+  w.onclose=function(ev){
     if(my!==liveGen||!active||ws!==w)return;
+    logErr('通信が切れました（'+(ready?'通話中':'接続時')+' コード'+(ev&&ev.code)+' '+(ev&&ev.reason||'')+'／声:'+voice+'）');
     if(!ready&&!isFallback&&voice!==DEFAULT_VOICE){ /* 選んだ声が使えないときは、予備の声で1回だけやり直す */
       ws=null;
       getToken(DEFAULT_VOICE).then(function(t2){if(my===liveGen&&active)connect(my,t2,DEFAULT_VOICE,true)})
-        .catch(function(){if(my===liveGen&&active)liveClosing()});
+        .catch(function(e){logErr(e&&e.message||e);if(my===liveGen&&active)liveClosing()});
       return;
     }
     liveClosing();
   };
 }
+function begin(my,w){
+  if(my!==liveGen||ws!==w||!active)return;
+  lastAct=Date.now();stopRing();$('cSt').textContent='お話し中…';
+  startMic(my,w);
+  wdT=setInterval(function(){if(my===liveGen&&!speaking&&Date.now()-lastAct>60000)liveClosing()},5000); /* 無言が長く続いたとき */
+  w.send(JSON.stringify({realtimeInput:{text:'電話がつながりました。最初の一言を話してください。'}}));
+}
 function onMsg(my,w,voice,isFallback,m){
+  if(m.error)logErr('サーバー: '+JSON.stringify(m.error));
   if(m.setupComplete){
-    ready=true;lastAct=Date.now();stopRing();
+    ready=true;
     if(isFallback){S.lv=voice;saveS();try{localStorage.setItem('phoneSimVoiceNote','1')}catch(e){}}
-    startMic(my,w);
-    wdT=setInterval(function(){if(my===liveGen&&!speaking&&Date.now()-lastAct>60000)liveClosing()},5000); /* 無言が長く続いたとき */
-    w.send(JSON.stringify({realtimeInput:{text:'電話がつながりました。最初の一言を話してください。'}}));
+    var d=ringEnd-Date.now(); /* 3コール鳴り終わってから話し始める */
+    if(d>0)T(function(){begin(my,w)},d);else begin(my,w);
     return;
   }
   var sc=m.serverContent;
   if(sc){
     if(sc.interrupted)stopPlay();
     var parts=sc.modelTurn&&sc.modelTurn.parts;
-    if(parts)parts.forEach(function(p){if(p.inlineData&&p.inlineData.data)playChunk(p.inlineData.data)});
+    if(parts&&parts.length){
+      if(greeted&&turns>=MAX_TURNS-1){liveClosing();return} /* 20回目の返事は、会話に関係なく「通信制限」のひと言にする */
+      parts.forEach(function(p){if(p.inlineData&&p.inlineData.data)playChunk(p.inlineData.data)});
+    }
     if(sc.turnComplete){
       lastAct=Date.now();
       if(!greeted)greeted=true;else turns++;
-      if(turns>=MAX_TURNS)endAfter=true;
       checkEnd();
     }
   }
   if(m.goAway){endAfter=true;checkEnd()}
 }
-/* 話し相手の声を再生（24kHz・16bit PCM） */
+/* 話し相手の声を再生（24kHz・16bit PCM）。速さは設定（S.sp）に合わせてゆっくりにする */
 function playChunk(d){
   var a=ctx();if(!a)return;
   var bin=atob(d),n=bin.length>>1,buf=a.createBuffer(1,n,24000),ch=buf.getChannelData(0);
   for(var i=0;i<n;i++){var v=bin.charCodeAt(2*i)|(bin.charCodeAt(2*i+1)<<8);if(v>=32768)v-=65536;ch[i]=v/32768}
-  var s=a.createBufferSource();s.buffer=buf;s.connect(master);
-  var t=Math.max(a.currentTime+.03,pbT);s.start(t);pbT=t+buf.duration;
+  var s=a.createBufferSource();s.buffer=buf;s.playbackRate.value=S.sp||1;s.connect(master);
+  var t=Math.max(a.currentTime+.03,pbT);s.start(t);pbT=t+buf.duration/(S.sp||1);
   speaking=true;pbN++;clearTimeout(unT);srcs.push(s);
-  $('cSt').textContent='お話し中…';
   s.onended=function(){
     var k=srcs.indexOf(s);if(k>=0)srcs.splice(k,1);pbN--;
     if(pbN<=0){pbN=0;clearTimeout(unT);unT=setTimeout(function(){speaking=false;if(aiOn){$('cSt').textContent='お話しください…';lastAct=Date.now()}checkEnd()},500)} /* 声が終わってから少し待ってマイクを戻す（エコー防止） */
@@ -424,7 +447,35 @@ async function startMic(my,w){
       w.send(JSON.stringify({realtimeInput:{audio:{data:b64(e.data),mimeType:'audio/pcm;rate=16000'}}}));
     };
     if(micCtx.state==='suspended')micCtx.resume();
-  }catch(e){if(my===liveGen)liveClosing()}
+  }catch(e){logErr('マイク処理: '+e);if(my===liveGen)liveClosing()}
+}
+/* 設定画面：声の試し聞き（通話中は使えない） */
+async function testVoice(){
+  if(active)return;
+  var hint=$('vHint'),my=++testGen;
+  try{if(testWs){testWs.onmessage=testWs.onclose=null;testWs.close()}}catch(e){}
+  hint.textContent='試し聞きの準備中…';
+  var tk;try{tk=await getToken(S.lv,true)}catch(e){logErr(e&&e.message||e);hint.textContent='試し聞きできませんでした（つながりません）。';return}
+  if(my!==testGen)return;
+  ctx();
+  var w;try{w=new WebSocket(wsUrl(tk.token))}catch(e){hint.textContent='試し聞きできませんでした。';return}
+  testWs=w;var done=false,chain=Promise.resolve(),started=false;
+  var fin=function(msg){if(done)return;done=true;clearTimeout(tm);try{w.close()}catch(e){}if(my===testGen)hint.textContent=msg||''};
+  var tm=setTimeout(function(){fin('試し聞きできませんでした。')},20000);
+  w.onopen=function(){w.send(JSON.stringify(setupMsg(tk,tk.voice)))};
+  w.onmessage=function(ev){
+    chain=chain.then(function(){return typeof ev.data==='string'?ev.data:ev.data.text()}).then(function(s){
+      var m=JSON.parse(s);
+      if(m.setupComplete){w.send(JSON.stringify({realtimeInput:{text:'つぎの文を、そのまま読み上げてください。「もしもし、お電話ありがとうございます。今日は、どんな調子ですか？」'}}));hint.textContent='試し聞き中…';return}
+      var sc=m.serverContent;
+      if(sc){
+        var parts=sc.modelTurn&&sc.modelTurn.parts;
+        if(parts)parts.forEach(function(p){if(p.inlineData&&p.inlineData.data){started=true;playChunk(p.inlineData.data)}});
+        if(sc.turnComplete)fin('');
+      }
+    }).catch(function(){});
+  };
+  w.onclose=function(ev){if(!done){logErr('試し聞き: コード'+(ev&&ev.code)+' '+(ev&&ev.reason||'')+' 声:'+tk.voice);fin(started?'':'試し聞きできませんでした。声が使えない可能性があります。')}};
 }
 function emergency(n){
   clearAll();active=true;
@@ -481,8 +532,8 @@ $('mYes').onclick=function(){if(onYes&&onYes())$('md').classList.remove('on')};
 /* ---------- スタッフ用（3秒長押し＋暗証番号で開く） ---------- */
 var STAFF_PIN='1234',lp=null,sto=null;
 loadP();
-var SK='phoneSimSettings',VOICES=[['Dipper','Dipper（初期値）'],['Pegasus','Pegasus'],['Capella','Capella'],['Charon','Charon（予備・落ち着いた男性）'],['Umbriel','Umbriel（おだやか）'],['Orus','Orus（しっかり）']];
-try{var sv=JSON.parse(localStorage.getItem(SK));if(sv&&typeof sv==='object'){S.mins=+sv.mins===30?30:60;if(VOICES.some(function(v){return v[0]===sv.lv}))S.lv=sv.lv}}catch(e){}
+var SK='phoneSimSettings',VOICES=[['Charon','Charon（男性・落ち着いた）'],['Umbriel','Umbriel（男性・気さく）'],['Schedar','Schedar（男性・安定）'],['Iapetus','Iapetus（男性・はっきり）'],['Algieba','Algieba（男性・なめらか）'],['Vindemiatrix','Vindemiatrix（女性・おだやか）'],['Sulafat','Sulafat（女性・あたたかい）'],['Achernar','Achernar（女性・やわらか）'],['Gacrux','Gacrux（女性・落ち着き）']];
+try{var sv=JSON.parse(localStorage.getItem(SK));if(sv&&typeof sv==='object'){S.mins=+sv.mins===30?30:60;if(VOICES.some(function(v){return v[0]===sv.lv}))S.lv=sv.lv;if([1,.92,.85].indexOf(+sv.sp)>=0)S.sp=+sv.sp}}catch(e){}
 function saveS(){try{localStorage.setItem(SK,JSON.stringify(S))}catch(e){}}
 function fillVoices(){
   var sel=$('sVoice');sel.innerHTML='';
@@ -491,11 +542,13 @@ function fillVoices(){
   var n='';try{n=localStorage.getItem('phoneSimVoiceNote')}catch(e){}
   $('vHint').textContent=n?'選んだ声が使えなかったため、予備の声（'+S.lv+'）に切り替わりました。':'';
 }
-function updSet(){$('pAi').value=P.ai_name;$('pGf').value=P.grandfather_name;$('pDau').value=P.daughter_name;$('sLim').value=String(S.mins);fillVoices()}
+function updSet(){$('pAi').value=P.ai_name;$('pGf').value=P.grandfather_name;$('pDau').value=P.daughter_name;$('sLim').value=String(S.mins);$('sSpeed').value=String(S.sp);fillVoices();var e='';try{e=localStorage.getItem('phoneSimLastErr')}catch(x){}$('lastErr').textContent=e||'（記録はありません）'}
 [['pAi','ai_name'],['pGf','grandfather_name'],['pDau','daughter_name']].forEach(function(x){$(x[0]).oninput=function(){P[x[1]]=this.value;saveP()}});
 $('sLim').onchange=function(){S.mins=+this.value===30?30:60;saveS()};
 $('sVoice').onchange=function(){S.lv=this.value;saveS();try{localStorage.removeItem('phoneSimVoiceNote')}catch(e){}$('vHint').textContent=''};
-function resetSettings(){S.mins=60;S.lv='Dipper';loadP();updSet()}
+$('sSpeed').onchange=function(){S.sp=+this.value;saveS()};
+$('sTest').onclick=function(){ctx();testVoice()};
+function resetSettings(){S.mins=60;S.lv='Charon';S.sp=.92;loadP();updSet()}
 function staffOn(){document.body.classList.add('staff');updSet();tab(2);bump()}
 function staffOff(){clearTimeout(sto);document.body.classList.remove('staff');tab(0)}
 function bump(){if(!document.body.classList.contains('staff'))return;clearTimeout(sto);sto=setTimeout(staffOff,180000)}
