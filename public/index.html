@@ -372,7 +372,7 @@ function connect(my,tk,voice,isFallback){
       .then(function(s){if(my===liveGen&&ws===w)onMsg(my,w,voice,isFallback,JSON.parse(s))})
       .catch(function(){});
   };
-  w.onerror=function(){};
+  w.onerror=function(){if(my===liveGen)logErr('Gemini Live WebSocketで通信エラーが発生しました');};
   w.onclose=function(ev){
     if(my!==liveGen||!active||ws!==w)return;
     logErr('通信が切れました（'+(ready?'通話中':'接続時')+' コード'+(ev&&ev.code)+' '+(ev&&ev.reason||'')+'／声:'+voice+'）');
@@ -473,7 +473,7 @@ async function testVoice(){
         if(parts)parts.forEach(function(p){if(p.inlineData&&p.inlineData.data){started=true;playChunk(p.inlineData.data)}});
         if(sc.turnComplete)fin('');
       }
-    }).catch(function(){});
+    }).catch(function(e){if(my===testGen){logErr('試し聞き受信処理: '+(e&&e.message||e));hint.textContent='試し聞きできませんでした。設定画面の「前回の通話の記録」を確認してください。'}});
   };
   w.onclose=function(ev){if(!done){logErr('試し聞き: コード'+(ev&&ev.code)+' '+(ev&&ev.reason||'')+' 声:'+tk.voice);fin(started?'':'試し聞きできませんでした。声が使えない可能性があります。')}};
 }
