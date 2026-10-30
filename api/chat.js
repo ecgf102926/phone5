@@ -122,7 +122,14 @@ module.exports = async function handler(req, res) {
         newSessionExpireTime: new Date(now + 60000).toISOString(),        // 1分以内に接続を始めないと失効
         liveConnectConstraints: {
           model: 'models/' + LIVE_MODEL,
-          config: { responseModalities: ['AUDIO'] },
+          config: {
+            responseModalities: ['AUDIO'],
+            speechConfig: {
+              voiceConfig: {
+                prebuiltVoiceConfig: { voiceName: voice }
+              }
+            }
+          },
         },
       }),
       signal: AbortSignal.timeout(9000),
